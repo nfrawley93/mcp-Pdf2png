@@ -7,9 +7,10 @@ from pdf2image import convert_from_path
 import os
 import tempfile
 import re
-from urllib.request import urlopen
+from urllib.request import urlopen, Request
 from concurrent.futures import ThreadPoolExecutor
 import json
+from base64 import b64encode
 
 server = Server("pdf2png")
 
@@ -29,10 +30,8 @@ def download_file(url: str, filepath: str) -> None:
                 f.write(chunk)
 
 
-# Synchronous helper: POST file to URL using multipart/form-data
-def post_file(url: str, filepath: str) -> None:
-    from urllib.request import Request, urlopen
-    from urllib.parse import urlencode
+# Synchronous helper: POST file to URL using multipart/form-data + optional Basic Auth
+def post_file(url: str, filepath: str, username: str | None = None, password: str | None = None) -> None:
     from mimetypes import guess_type
 
     # Read file content
@@ -45,12 +44,17 @@ def post_file(url: str, filepath: str) -> None:
         'Content-Type': f'multipart/form-data; boundary={boundary.decode()}'
     }
 
+    # Add Basic Auth if credentials provided
+    if username and password:
+        credentials = f"{username}:{password}".encode()
+        auth_header = b"Basic " + b64encode(credentials)
+        headers['Authorization'] = auth_header
+
     # Build body
     body_parts = []
     filename = os.path.basename(filepath)
     mime_type = guess_type(filename)[0] or 'application/octet-stream'
 
-    # Add file field (assuming field name is "file")
     body_parts.extend([
         b'--' + boundary,
         f'Content-Disposition: form-data; name="file"; filename="{filename}"'.encode(),
@@ -70,6 +74,7 @@ def post_file(url: str, filepath: str) -> None:
         if response.status >= 400:
             raise Exception(f"HTTP {response.status}: {response.read().decode()}")
 
+
 @server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
     """List available tools."""
@@ -88,13 +93,15 @@ async def handle_list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="pdf2png_upload",
-            description="Converts PDF to PNG images, uploads them via POST to a URL, then deletes local files. Accepts local paths or URLs.",
+            description="Converts PDF to PNG images, uploads them via POST to a URL with optional Basic Auth, then deletes local files. Accepts local paths or URLs.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "read_file_path": {"type": "string"},
                     "upload_url": {"type": "string", "format": "uri"},
                     "write_folder_path": {"type": "string"},
+                    "auth_username": {"type": "string", "nullable": True},
+                    "auth_password": {"type": "string", "nullable": True},
                 },
                 "required": ["read_file_path", "upload_url", "write_folder_path"],
             },
@@ -166,10 +173,12 @@ async def _convert_pdf_only(arguments: dict) -> list[types.TextContent]:
 
 
 async def _convert_and_upload_pdf(arguments: dict) -> list[types.TextContent]:
-    """Internal helper: Convert PDF, upload PNGs, then delete locally"""
+    """Internal helper: Convert PDF, upload PNGs, then delete locally with optional Basic Auth"""
     read_file_path = arguments.get("read_file_path")
     upload_url = arguments.get("upload_url")
     write_folder_path = arguments.get("write_folder_path")
+    auth_username = arguments.get("auth_username")  # Optional
+    auth_password = arguments.get("auth_password")  # Optional
 
     if not read_file_path or not upload_url or not write_folder_path:
         raise ValueError("Missing required fields: 'read_file_path', 'upload_url', or 'write_folder_path'")
@@ -203,7 +212,7 @@ async def _convert_and_upload_pdf(arguments: dict) -> list[types.TextContent]:
         if not created_pngs:
             raise ValueError("No pages were generated from PDF")
 
-        # Step 3: Upload each PNG
+        # Step 3: Upload each PNG with optional Basic Auth
         uploaded_count = 0
         loop = asyncio.get_event_loop()
 
@@ -213,24 +222,27 @@ async def _convert_and_upload_pdf(arguments: dict) -> list[types.TextContent]:
                     ThreadPoolExecutor(max_workers=1),
                     post_file,
                     upload_url,
-                    png_path
+                    png_path,
+                    auth_username,
+                    auth_password
                 )
                 uploaded_count += 1
                 print(f"Uploaded: {png_path}")
             except Exception as e:
                 print(f"Failed to upload {png_path}: {e}")
 
-        # Step 4: Delete all local PNGs after successful upload
+        # Step 4: Delete all local PNGs after upload
         for png_path in created_pngs:
             try:
                 os.unlink(png_path)
             except Exception as e:
                 print(f"Warning: Failed to delete local file {png_path}: {e}")
 
+        auth_str = f" with Basic Auth" if auth_username else " without authentication"
         return [
             types.TextContent(
                 type="text",
-                text=f"Successfully converted PDF to {len(created_pngs)} PNG files, uploaded {uploaded_count} of them to {upload_url}, and deleted local copies."
+                text=f"Successfully converted PDF to {len(created_pngs)} PNG files, uploaded {uploaded_count} of them to {upload_url}{auth_str}, and deleted local copies."
             )
         ]
 
