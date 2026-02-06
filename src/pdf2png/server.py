@@ -9,12 +9,66 @@ import tempfile
 import re
 from urllib.request import urlopen
 from concurrent.futures import ThreadPoolExecutor
+import json
 
 server = Server("pdf2png")
 
 # Helper: Check if string is a URL
 def is_url(path: str) -> bool:
     return re.match(r'^https?://', path) is not None
+
+
+# Synchronous helper: download file from URL to local path
+def download_file(url: str, filepath: str) -> None:
+    with urlopen(url) as response:
+        with open(filepath, 'wb') as f:
+            while True:
+                chunk = response.read(8192)
+                if not chunk:
+                    break
+                f.write(chunk)
+
+
+# Synchronous helper: POST file to URL using multipart/form-data
+def post_file(url: str, filepath: str) -> None:
+    from urllib.request import Request, urlopen
+    from urllib.parse import urlencode
+    from mimetypes import guess_type
+
+    # Read file content
+    with open(filepath, 'rb') as f:
+        file_data = f.read()
+
+    # Prepare multipart form data
+    boundary = b'------------------------' + str(hash(url)).encode()
+    headers = {
+        'Content-Type': f'multipart/form-data; boundary={boundary.decode()}'
+    }
+
+    # Build body
+    body_parts = []
+    filename = os.path.basename(filepath)
+    mime_type = guess_type(filename)[0] or 'application/octet-stream'
+
+    # Add file field (assuming field name is "file")
+    body_parts.extend([
+        b'--' + boundary,
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"'.encode(),
+        f'Content-Type: {mime_type}'.encode(),
+        b'',
+        file_data
+    ])
+
+    # Final boundary
+    body_parts.extend([b'--' + boundary + b'--', b''])
+
+    body = b'\r\n'.join(body_parts)
+
+    # Send request
+    req = Request(url, data=body, headers=headers)
+    with urlopen(req) as response:
+        if response.status >= 400:
+            raise Exception(f"HTTP {response.status}: {response.read().decode()}")
 
 @server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
@@ -31,7 +85,20 @@ async def handle_list_tools() -> list[types.Tool]:
                 },
                 "required": ["read_file_path", "write_folder_path"],
             },
-        )
+        ),
+        types.Tool(
+            name="pdf2png_upload",
+            description="Converts PDF to PNG images, uploads them via POST to a URL, then deletes local files. Accepts local paths or URLs.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "read_file_path": {"type": "string"},
+                    "upload_url": {"type": "string", "format": "uri"},
+                    "write_folder_path": {"type": "string"},
+                },
+                "required": ["read_file_path", "upload_url", "write_folder_path"],
+            },
+        ),
     ]
 
 @server.call_tool()
@@ -39,46 +106,44 @@ async def handle_call_tool(
     name: str, arguments: dict | None
 ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
     """Handle tool execution requests."""
-    if name != "pdf2png":
-        raise ValueError(f"Unknown tool: {name}")
-
     if not arguments:
         raise ValueError("Missing arguments")
 
+    if name == "pdf2png":
+        return await _convert_pdf_only(arguments)
+
+    elif name == "pdf2png_upload":
+        return await _convert_and_upload_pdf(arguments)
+
+    else:
+        raise ValueError(f"Unknown tool: {name}")
+
+
+async def _convert_pdf_only(arguments: dict) -> list[types.TextContent]:
+    """Internal helper: Convert PDF to PNGs (no upload)"""
     read_file_path = arguments.get("read_file_path")
     write_folder_path = arguments.get("write_folder_path")
 
     if not read_file_path or not write_folder_path:
         raise ValueError("Missing 'read_file_path' or 'write_folder_path'")
 
-    # Determine if we're dealing with a remote URL
     temp_pdf_path = None
     try:
         if is_url(read_file_path):
-            print(f"Downloading PDF from {read_file_path}...")
             loop = asyncio.get_event_loop()
-
-            # Use ThreadPoolExecutor to run blocking urllib.request in background
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
                 temp_pdf_path = tmp_pdf.name
-
-                # Run the blocking HTTP request in a thread
                 await loop.run_in_executor(
                     ThreadPoolExecutor(max_workers=1),
                     download_file,
                     read_file_path,
                     temp_pdf_path
                 )
+            read_file_path = temp_pdf_path
 
-            read_file_path = temp_pdf_path  # Override with local path
-
-        # Convert PDF to PNG (now either local or downloaded)
         images = convert_from_path(read_file_path)
-
-        # Create output directory if it doesn't exist
         os.makedirs(write_folder_path, exist_ok=True)
 
-        # Save each page as PNG
         output_files = []
         for i, image in enumerate(images):
             output_path = os.path.join(write_folder_path, f'page_{i+1}.png')
@@ -93,7 +158,6 @@ async def handle_call_tool(
         ]
 
     finally:
-        # Clean up temporary file if we created one
         if temp_pdf_path and os.path.exists(temp_pdf_path):
             try:
                 os.unlink(temp_pdf_path)
@@ -101,19 +165,85 @@ async def handle_call_tool(
                 print(f"Warning: Failed to delete temp file {temp_pdf_path}: {e}")
 
 
-# Synchronous helper function to download a file (runs in thread pool)
-def download_file(url: str, filepath: str) -> None:
-    with urlopen(url) as response:
-        with open(filepath, 'wb') as f:
-            while True:
-                chunk = response.read(8192)
-                if not chunk:
-                    break
-                f.write(chunk)
+async def _convert_and_upload_pdf(arguments: dict) -> list[types.TextContent]:
+    """Internal helper: Convert PDF, upload PNGs, then delete locally"""
+    read_file_path = arguments.get("read_file_path")
+    upload_url = arguments.get("upload_url")
+    write_folder_path = arguments.get("write_folder_path")
+
+    if not read_file_path or not upload_url or not write_folder_path:
+        raise ValueError("Missing required fields: 'read_file_path', 'upload_url', or 'write_folder_path'")
+
+    temp_pdf_path = None
+    created_pngs = []
+
+    try:
+        # Step 1: Download PDF if URL
+        if is_url(read_file_path):
+            loop = asyncio.get_event_loop()
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
+                temp_pdf_path = tmp_pdf.name
+                await loop.run_in_executor(
+                    ThreadPoolExecutor(max_workers=1),
+                    download_file,
+                    read_file_path,
+                    temp_pdf_path
+                )
+            read_file_path = temp_pdf_path
+
+        # Step 2: Convert PDF to PNGs
+        images = convert_from_path(read_file_path)
+        os.makedirs(write_folder_path, exist_ok=True)
+
+        for i, image in enumerate(images):
+            output_path = os.path.join(write_folder_path, f'page_{i+1}.png')
+            image.save(output_path, 'PNG')
+            created_pngs.append(output_path)
+
+        if not created_pngs:
+            raise ValueError("No pages were generated from PDF")
+
+        # Step 3: Upload each PNG
+        uploaded_count = 0
+        loop = asyncio.get_event_loop()
+
+        for png_path in created_pngs:
+            try:
+                await loop.run_in_executor(
+                    ThreadPoolExecutor(max_workers=1),
+                    post_file,
+                    upload_url,
+                    png_path
+                )
+                uploaded_count += 1
+                print(f"Uploaded: {png_path}")
+            except Exception as e:
+                print(f"Failed to upload {png_path}: {e}")
+
+        # Step 4: Delete all local PNGs after successful upload
+        for png_path in created_pngs:
+            try:
+                os.unlink(png_path)
+            except Exception as e:
+                print(f"Warning: Failed to delete local file {png_path}: {e}")
+
+        return [
+            types.TextContent(
+                type="text",
+                text=f"Successfully converted PDF to {len(created_pngs)} PNG files, uploaded {uploaded_count} of them to {upload_url}, and deleted local copies."
+            )
+        ]
+
+    finally:
+        # Clean up temporary PDF if it was downloaded
+        if temp_pdf_path and os.path.exists(temp_pdf_path):
+            try:
+                os.unlink(temp_pdf_path)
+            except Exception as e:
+                print(f"Warning: Failed to delete temp PDF file {temp_pdf_path}: {e}")
 
 
 async def main():
-    # Run the server using stdin/stdout streams
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,
