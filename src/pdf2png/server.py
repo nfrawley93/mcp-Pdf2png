@@ -7,7 +7,8 @@ from pdf2image import convert_from_path
 import os
 import tempfile
 import re
-import aiohttp
+from urllib.request import urlopen
+from concurrent.futures import ThreadPoolExecutor
 
 server = Server("pdf2png")
 
@@ -55,17 +56,20 @@ async def handle_call_tool(
     try:
         if is_url(read_file_path):
             print(f"Downloading PDF from {read_file_path}...")
-            async with aiohttp.ClientSession() as session:
-                async with session.get(read_file_path) as response:
-                    response.raise_for_status()
-                    # Create temporary file to store downloaded PDF
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
-                        temp_pdf_path = tmp_pdf.name
-                        while True:
-                            chunk = await response.content.read(8192)
-                            if not chunk:
-                                break
-                            tmp_pdf.write(chunk)
+            loop = asyncio.get_event_loop()
+
+            # Use ThreadPoolExecutor to run blocking urllib.request in background
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
+                temp_pdf_path = tmp_pdf.name
+
+                # Run the blocking HTTP request in a thread
+                await loop.run_in_executor(
+                    ThreadPoolExecutor(max_workers=1),
+                    download_file,
+                    read_file_path,
+                    temp_pdf_path
+                )
+
             read_file_path = temp_pdf_path  # Override with local path
 
         # Convert PDF to PNG (now either local or downloaded)
@@ -95,6 +99,18 @@ async def handle_call_tool(
                 os.unlink(temp_pdf_path)
             except Exception as e:
                 print(f"Warning: Failed to delete temp file {temp_pdf_path}: {e}")
+
+
+# Synchronous helper function to download a file (runs in thread pool)
+def download_file(url: str, filepath: str) -> None:
+    with urlopen(url) as response:
+        with open(filepath, 'wb') as f:
+            while True:
+                chunk = response.read(8192)
+                if not chunk:
+                    break
+                f.write(chunk)
+
 
 async def main():
     # Run the server using stdin/stdout streams
